@@ -1,10 +1,12 @@
 import { Search, User } from 'lucide-react';
 
 interface TopBarProps {
-  highPriorityCount: number;
+  openActions: number;
+  redDeals: number;
+  draftsReady: number;
 }
 
-export function TopBar({ highPriorityCount }: TopBarProps) {
+export function TopBar({ openActions, redDeals, draftsReady }: TopBarProps) {
   return (
     <div className="bg-white border-b border-gray-200 px-6 py-4">
       <div className="flex items-center justify-between">
@@ -22,7 +24,11 @@ export function TopBar({ highPriorityCount }: TopBarProps) {
         <div className="flex items-center gap-6 ml-6">
           <div className="text-right">
             <div className="text-sm font-medium text-gray-900">
-              Today: <span className="text-red-600">{highPriorityCount} high-priority actions</span>
+              <span className="text-red-600">{openActions} open actions</span>
+              <span className="mx-2 text-gray-300">•</span>
+              <span className="text-red-600">{redDeals} red deals</span>
+              <span className="mx-2 text-gray-300">•</span>
+              <span className="text-blue-600">{draftsReady} drafts ready</span>
             </div>
             <div className="text-xs text-gray-500">Last updated: just now</div>
           </div>

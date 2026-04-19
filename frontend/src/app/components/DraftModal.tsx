@@ -1,5 +1,5 @@
 import { X, Mail, MessageSquare, Sparkles, Send, Copy } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 interface DraftModalProps {
   isOpen: boolean;
@@ -10,11 +10,38 @@ interface DraftModalProps {
   onSimulate: (draft: string) => void;
 }
 
-export function DraftModal({ isOpen, onClose, leadName, initialDraft, onApprove, onSimulate }: DraftModalProps) {
+function inferDraftType(text: string): 'email' | 'sms' {
+  const trimmed = text.trim();
+  if (!trimmed) return 'email';
+  if (/^subject:/i.test(trimmed)) return 'email';
+  if (trimmed.includes('\n')) return 'email';
+  return trimmed.length > 180 ? 'email' : 'sms';
+}
+
+export function DraftModal({
+  isOpen,
+  onClose,
+  leadName,
+  initialDraft,
+  onApprove,
+  onSimulate,
+}: DraftModalProps) {
   const [draft, setDraft] = useState(initialDraft);
-  const [messageType, setMessageType] = useState<'email' | 'sms'>('email');
+  const [messageType, setMessageType] = useState<'email' | 'sms'>(inferDraftType(initialDraft));
+
+  useEffect(() => {
+    if (isOpen) {
+      setDraft(initialDraft);
+      setMessageType(inferDraftType(initialDraft));
+    }
+  }, [initialDraft, isOpen]);
 
   if (!isOpen) return null;
+
+  const resetDraft = () => {
+    setDraft(initialDraft);
+    setMessageType(inferDraftType(initialDraft));
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -27,10 +54,7 @@ export function DraftModal({ isOpen, onClose, leadName, initialDraft, onApprove,
               <h2 className="font-semibold text-xl text-gray-900">Draft Message</h2>
               <p className="text-sm text-gray-500 mt-1">To: {leadName}</p>
             </div>
-            <button
-              onClick={onClose}
-              className="text-gray-400 hover:text-gray-600 transition-colors"
-            >
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition-colors">
               <X className="w-6 h-6" />
             </button>
           </div>
@@ -86,7 +110,9 @@ export function DraftModal({ isOpen, onClose, leadName, initialDraft, onApprove,
               <Sparkles className="w-5 h-5 text-blue-600 flex-shrink-0 mt-0.5" />
               <div>
                 <p className="font-medium text-sm text-gray-900 mb-1">AI Writing Assistant</p>
-                <p className="text-xs text-gray-600">This draft was personalized based on the lead's history, preferences, and current deal stage.</p>
+                <p className="text-xs text-gray-600">
+                  This draft was personalized based on the lead's history, preferences, and current deal stage.
+                </p>
               </div>
             </div>
           </div>
@@ -95,9 +121,7 @@ export function DraftModal({ isOpen, onClose, leadName, initialDraft, onApprove,
         <div className="p-6 border-t border-gray-200 bg-gray-50">
           <div className="flex gap-3">
             <button
-              onClick={() => {
-                setDraft(initialDraft);
-              }}
+              onClick={resetDraft}
               className="px-4 py-2.5 text-sm font-medium text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors flex items-center gap-2"
             >
               <Sparkles className="w-4 h-4" />
