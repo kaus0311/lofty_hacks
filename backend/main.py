@@ -1,13 +1,12 @@
+import json
 import os
-import smtplib
-import ssl
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
-from email.message import EmailMessage
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -18,13 +17,6 @@ FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_SECURE = os.getenv("SMTP_SECURE", "true").lower() == "true"
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-FROM_EMAIL = os.getenv("FROM_EMAIL", "Lofty Action Desk <no-reply@example.com>")
 
 LeadType = Literal["buyer", "seller"]
 DealStage = Literal["new", "qualified", "showing", "negotiation", "under_contract", "closed"]
@@ -42,6 +34,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -----------------------------
+# Models
+# -----------------------------
 
 class Listing(BaseModel):
     address: str
@@ -61,7 +57,7 @@ class Lead(BaseModel):
     engagementScore: int
     email: Optional[str] = None
     phone: Optional[str] = None
-    notes: List[str] = []
+    notes: List[str] = Field(default_factory=list)
     listing: Optional[Listing] = None
 
 class Action(BaseModel):
@@ -80,12 +76,26 @@ class Action(BaseModel):
     sentAt: Optional[str] = None
     sentTo: Optional[str] = None
     subject: Optional[str] = None
-    draft: Optional[str] = None
+    draft: Optional[Dict[str, Any]] = None
+    draftUpdatedAt: Optional[str] = None
+
+class ActivityEvent(BaseModel):
+    id: str
+    timestamp: str
+    type: str
+    entityType: str
+    entityId: str
+    title: str
+    details: Dict[str, Any] = Field(default_factory=dict)
 
 class DraftRequest(BaseModel):
     tone: Tone = "friendly"
     channel: Channel = "email"
     goal: str = "re-engage the lead and move the deal forward"
+
+class DraftUpdateRequest(BaseModel):
+    subject: Optional[str] = None
+    draft: Dict[str, Any]
 
 class ExplainRequest(BaseModel):
     detailLevel: Literal["short", "full"] = "short"
@@ -102,9 +112,23 @@ class SmartPlanItem(BaseModel):
     action: str
     rationale: str
 
+class StageUpdateRequest(BaseModel):
+    stage: DealStage
+    note: Optional[str] = None
+
+class ListingUpdateRequest(BaseModel):
+    address: Optional[str] = None
+    daysOnMarket: Optional[int] = None
+    priceReductionDiscussed: Optional[bool] = None
+
+# -----------------------------
+# Mock store
+# -----------------------------
+
 db = {
     "leads": [],
-    "actions": []
+    "actions": [],
+    "activities": [],
 }
 
 def now_iso() -> str:
@@ -115,6 +139,25 @@ def uid(prefix: str) -> str:
 
 def clamp(n: int, min_v: int, max_v: int) -> int:
     return max(min_v, min(n, max_v))
+
+def log_activity(
+    event_type: str,
+    entity_type: str,
+    entity_id: str,
+    title: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    event = ActivityEvent(
+        id=uid("evt"),
+        timestamp=now_iso(),
+        type=event_type,
+        entityType=entity_type,
+        entityId=entity_id,
+        title=title,
+        details=details or {},
+    )
+    db["activities"].insert(0, event)
+    db["activities"][:] = db["activities"][:300]
 
 def get_deal_health_score(lead: Lead):
     score = 100
@@ -166,34 +209,61 @@ def priority_from_score(score: int) -> Priority:
         return "medium"
     return "low"
 
+def suggested_channel_for_lead(lead: Lead) -> Channel:
+    if lead.replied:
+        return "sms"
+    if lead.emailOpened:
+        return "call"
+    return "email"
+
+def recommended_tone_for_lead(lead: Lead) -> Tone:
+    return "formal" if lead.stage == "negotiation" else "friendly"
+
+def action_title_for_lead(lead: Lead) -> str:
+    return f"Re-engage {lead.name}" if lead.type == "seller" else f"Follow up with {lead.name}"
+
+def action_reason_for_lead(lead: Lead) -> str:
+    health = get_deal_health_score(lead)
+    base_reason = ", ".join(health["reasons"]) if health["reasons"] else "recent engagement and pipeline status suggest a normal follow-up"
+    return f"{base_reason}. Suggested next step: {suggested_channel_for_lead(lead)} follow-up."
+
 def build_actions_for_lead(lead: Lead):
     health = get_deal_health_score(lead)
     priority = priority_from_score(health["score"])
-    channel: Channel = "sms" if lead.replied else "call" if lead.emailOpened else "email"
-    tone: Tone = "formal" if lead.stage == "negotiation" else "friendly"
-
-    title = f"Re-engage {lead.name}" if lead.type == "seller" else f"Follow up with {lead.name}"
-    reason = ", ".join(health["reasons"]) if health["reasons"] else "recent engagement and pipeline status suggest a normal follow-up"
-    if reason:
-        reason = f"{reason}. Suggested next step: {channel} follow-up."
-
     return Action(
         id=uid("action"),
         leadId=lead.id,
-        title=title,
+        title=action_title_for_lead(lead),
         priority=priority,
         health=health["health"],
-        reason=reason,
+        reason=action_reason_for_lead(lead),
         createdAt=now_iso(),
-        suggestedChannel=channel,
-        recommendedTone=tone,
+        suggestedChannel=suggested_channel_for_lead(lead),
+        recommendedTone=recommended_tone_for_lead(lead),
         completed=False,
         approved=False,
         sent=False,
     )
 
+def refresh_open_actions_for_lead(lead: Lead) -> None:
+    health = get_deal_health_score(lead)
+    priority = priority_from_score(health["score"])
+
+    for action in db["actions"]:
+        if action.leadId != lead.id:
+            continue
+        if action.completed or action.sent:
+            continue
+
+        action.priority = priority
+        action.health = health["health"]
+        action.title = action_title_for_lead(lead)
+        action.reason = action_reason_for_lead(lead)
+        action.suggestedChannel = suggested_channel_for_lead(lead)
+        action.recommendedTone = recommended_tone_for_lead(lead)
+
 def seed_data():
-    leads = [
+    db["leads"] = [
         Lead(
             id="lead_001",
             name="John Smith",
@@ -243,28 +313,23 @@ def seed_data():
         ),
     ]
 
-    actions = [build_actions_for_lead(lead) for lead in leads]
-    db["leads"] = leads
-    db["actions"] = actions
+    db["actions"] = [build_actions_for_lead(lead) for lead in db["leads"]]
+    db["activities"] = []
+    log_activity("seed", "system", "seed", "Seeded mock CRM data", {"leads": len(db["leads"]), "actions": len(db["actions"])})
 
 seed_data()
 
-def find_lead(lead_id: str):
-    for lead in db["leads"]:
-        if lead.id == lead_id:
-            return lead
-    return None
+def find_lead(lead_id: str) -> Optional[Lead]:
+    return next((l for l in db["leads"] if l.id == lead_id), None)
 
-def find_action(action_id: str):
-    for action in db["actions"]:
-        if action.id == action_id:
-            return action
-    return None
+def find_action(action_id: str) -> Optional[Action]:
+    return next((a for a in db["actions"] if a.id == action_id), None)
 
 def action_with_lead(action: Action):
     lead = find_lead(action.leadId)
     if not lead:
         return None
+
     health = get_deal_health_score(lead)
     return {
         **action.model_dump(),
@@ -273,75 +338,217 @@ def action_with_lead(action: Action):
         "healthReasons": health["reasons"],
     }
 
-def make_subject(lead: Lead):
+def make_subject(lead: Lead) -> str:
     if lead.type == "seller":
-        return f"Quick update on {lead.listing.address if lead.listing else 'your listing'}"
+        listing_name = lead.listing.address if lead.listing else "your listing"
+        return f"Quick update on {listing_name}"
     return "Quick follow-up on your search"
 
-async def call_openai(prompt: str):
+def draft_to_text(draft: Dict[str, Any]) -> str:
+    draft_type = draft.get("type")
+    if draft_type == "email":
+        return f"Subject: {draft.get('subject', '')}\n\n{draft.get('body', '')}"
+    if draft_type == "sms":
+        return draft.get("message", "")
+    if draft_type == "call":
+        parts = []
+        if draft.get("opening"):
+            parts.append(f"Opening: {draft['opening']}")
+        if draft.get("talkTrack"):
+            parts.append("Talk track:")
+            for item in draft["talkTrack"]:
+                parts.append(f"- {item}")
+        if draft.get("questions"):
+            parts.append("Questions:")
+            for item in draft["questions"]:
+                parts.append(f"- {item}")
+        if draft.get("close"):
+            parts.append(f"Close: {draft['close']}")
+        if draft.get("voicemail"):
+            parts.append(f"Voicemail: {draft['voicemail']}")
+        return "\n".join(parts)
+    return json.dumps(draft, indent=2)
+
+def fallback_draft(lead: Lead, action: Action, tone: Tone, channel: Channel, goal: str) -> Dict[str, Any]:
+    if channel == "email":
+        subject = make_subject(lead)
+        body = (
+            f"Hi {lead.name},\n\n"
+            f"I wanted to follow up to {goal}.\n\n"
+            f"Given where things stand, I think a quick check-in would be helpful.\n\n"
+            f"Would you be open to a quick update this week?\n\n"
+            f"Best,\nAgent"
+        )
+        return {
+            "type": "email",
+            "subject": subject,
+            "body": body,
+            "tone": tone,
+        }
+
+    if channel == "sms":
+        message = (
+            f"Hi {lead.name}, just following up on next steps. "
+            f"Would love to connect this week if you have a few minutes."
+        )
+        return {
+            "type": "sms",
+            "message": message,
+            "tone": tone,
+            "characterCount": len(message),
+        }
+
+    return {
+        "type": "call",
+        "opening": f"Hi {lead.name}, this is Agent calling about your { 'listing' if lead.type == 'seller' else 'home search' }.",
+        "talkTrack": [
+            "Confirm current priorities and timing",
+            "Reinforce the next best step",
+            "Ask about concerns or objections",
+        ],
+        "questions": [
+            "What changed since our last conversation?",
+            "What would make this a yes for you?",
+            "Is there anything blocking the next step?",
+        ],
+        "close": "Would it make sense to set up a quick follow-up later this week?",
+        "voicemail": f"Hi {lead.name}, it’s Agent. Calling with a quick update and next-step idea. I’ll follow up by text as well.",
+        "tone": tone,
+    }
+
+def structured_why(lead: Lead, action: Action) -> Dict[str, Any]:
+    health = get_deal_health_score(lead)
+    score = health["score"]
+
+    factors = []
+    if lead.lastTouchDays >= 7:
+        factors.append({
+            "label": "Stale follow-up",
+            "impact": -30,
+            "evidence": f"Last touch was {lead.lastTouchDays} days ago.",
+        })
+    elif lead.lastTouchDays >= 3:
+        factors.append({
+            "label": "Follow-up is aging",
+            "impact": -15,
+            "evidence": f"Last touch was {lead.lastTouchDays} days ago.",
+        })
+
+    if lead.emailOpened and not lead.replied:
+        factors.append({
+            "label": "Interest without reply",
+            "impact": -20,
+            "evidence": "Lead opened the email but did not reply.",
+        })
+
+    if lead.stage == "negotiation":
+        factors.append({
+            "label": "Negotiation needs speed",
+            "impact": -10,
+            "evidence": "Deal is in negotiation where timing can affect close rate.",
+        })
+
+    if lead.type == "seller" and lead.listing and lead.listing.daysOnMarket > 14:
+        factors.append({
+            "label": "Listing is aging",
+            "impact": -10,
+            "evidence": f"Listing has been on market for {lead.listing.daysOnMarket} days.",
+        })
+
+    if lead.engagementScore < 50:
+        factors.append({
+            "label": "Low engagement",
+            "impact": -15,
+            "evidence": f"Engagement score is {lead.engagementScore}.",
+        })
+
+    trust = [
+        "Recommendation is explainable from recency, engagement, and pipeline stage.",
+        "Agent approval is required before sending anything.",
+        "Drafts can be edited before approval.",
+    ]
+
+    next_steps = [
+        f"Send a {action.suggestedChannel} follow-up",
+        "Review the draft before approving",
+        "Update pipeline stage if the deal has changed",
+    ]
+
+    risks = []
+    if health["health"] == "red":
+        risks.append("High risk of losing momentum")
+    elif health["health"] == "yellow":
+        risks.append("Needs timely follow-up to avoid stalling")
+
+    return {
+        "summary": f"This action is {action.priority} priority because the lead is {health['health']} and needs a timely follow-up.",
+        "score": score,
+        "health": health["health"],
+        "factors": factors,
+        "trust": trust,
+        "recommended_next_steps": next_steps,
+        "risks": risks,
+    }
+
+async def call_openai_json(prompt: str) -> Optional[Dict[str, Any]]:
     if not OPENAI_API_KEY:
         return None
 
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": "You are a helpful real estate assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.4,
-    )
-    return resp.choices[0].message.content
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a helpful real estate assistant that returns valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+            response_format={"type": "json_object"},
+        )
 
-def fallback_draft(lead: Lead, action: Action, tone: Tone, channel: Channel):
-    greeting = f"Hi {lead.name},"
-    lines = [
-        greeting,
-        "",
-        f"I wanted to follow up on {'the listing' if lead.type == 'seller' else 'your search'}.",
-        "",
-        f"I think the next best step is a quick {channel} touch to keep momentum going.",
-        "",
-        "Would you be open to a quick update this week?",
-        "",
-        "Best,",
-    ]
-    return "\n".join(lines)
+        content = resp.choices[0].message.content
+        if not content:
+            return None
+        return json.loads(content)
+    except Exception:
+        return None
 
-def fallback_explanation(lead: Lead, action: Action):
-    health = get_deal_health_score(lead)
-    return {
-        "summary": f"This action is {action.priority} priority because the deal is {health['health']} and the lead needs a timely follow-up.",
-        "bullets": [f"• {r}" for r in health["reasons"]],
-    }
+async def call_openai_text(prompt: str) -> Optional[str]:
+    if not OPENAI_API_KEY:
+        return None
 
-def smtp_transporter_ready():
-    return all([SMTP_HOST, SMTP_USER, SMTP_PASS])
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
 
-def send_smtp_email(to_email: str, subject: str, body: str):
-    msg = EmailMessage()
-    msg["From"] = FROM_EMAIL
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a helpful real estate assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+        )
+        content = resp.choices[0].message.content
+        return content.strip() if content else None
+    except Exception:
+        return None
 
-    context = ssl.create_default_context()
-
-    if SMTP_SECURE:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls(context=context)
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
+# -----------------------------
+# Routes
+# -----------------------------
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "service": "lofty-action-desk-backend", "ts": now_iso()}
+    return {
+        "ok": True,
+        "service": "lofty-action-desk-backend",
+        "ts": now_iso(),
+        "openaiConfigured": bool(OPENAI_API_KEY),
+        "fakeSendOnly": True,
+    }
 
 @app.get("/api/leads")
 def get_leads():
@@ -356,6 +563,86 @@ def get_leads():
         })
     return {"leads": leads_out}
 
+@app.get("/api/leads/{lead_id}")
+def get_lead(lead_id: str):
+    lead = find_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    health = get_deal_health_score(lead)
+    related_actions = [action_with_lead(a) for a in db["actions"] if a.leadId == lead.id]
+    related_actions = [a for a in related_actions if a is not None]
+
+    return {
+        "lead": {
+            **lead.model_dump(),
+            "healthScore": health["score"],
+            "dealHealth": health["health"],
+            "healthReasons": health["reasons"],
+        },
+        "actions": related_actions,
+    }
+
+@app.patch("/api/leads/{lead_id}/stage")
+def update_lead_stage(lead_id: str, payload: StageUpdateRequest):
+    lead = find_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    old_stage = lead.stage
+    lead.stage = payload.stage
+    refresh_open_actions_for_lead(lead)
+
+    log_activity(
+        "stage_update",
+        "lead",
+        lead.id,
+        f"Updated stage for {lead.name}",
+        {"from": old_stage, "to": payload.stage, "note": payload.note},
+    )
+
+    return {
+        "ok": True,
+        "message": "Lead stage updated",
+        "lead": lead.model_dump(),
+        "health": get_deal_health_score(lead),
+    }
+
+@app.patch("/api/leads/{lead_id}/listing")
+def update_listing(lead_id: str, payload: ListingUpdateRequest):
+    lead = find_lead(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    if not lead.listing:
+        lead.listing = Listing(address="Unknown address", daysOnMarket=0, priceReductionDiscussed=False)
+
+    old_listing = lead.listing.model_dump()
+
+    if payload.address is not None:
+        lead.listing.address = payload.address
+    if payload.daysOnMarket is not None:
+        lead.listing.daysOnMarket = payload.daysOnMarket
+    if payload.priceReductionDiscussed is not None:
+        lead.listing.priceReductionDiscussed = payload.priceReductionDiscussed
+
+    refresh_open_actions_for_lead(lead)
+
+    log_activity(
+        "listing_update",
+        "lead",
+        lead.id,
+        f"Updated listing for {lead.name}",
+        {"from": old_listing, "to": lead.listing.model_dump()},
+    )
+
+    return {
+        "ok": True,
+        "message": "Listing updated",
+        "lead": lead.model_dump(),
+        "health": get_deal_health_score(lead),
+    }
+
 @app.get("/api/actions")
 def get_actions():
     actions = [action_with_lead(a) for a in db["actions"]]
@@ -369,7 +656,47 @@ def get_action(action_id: str):
     if not action:
         raise HTTPException(status_code=404, detail="Action not found")
     hydrated = action_with_lead(action)
+    if not hydrated:
+        raise HTTPException(status_code=404, detail="Lead not found")
     return {"action": hydrated}
+
+@app.get("/api/actions/{action_id}/history")
+def get_action_history(action_id: str):
+    action = find_action(action_id)
+    if not action:
+        raise HTTPException(status_code=404, detail="Action not found")
+
+    lead_id = action.leadId
+    items = [
+        e.model_dump()
+        for e in db["activities"]
+        if e.entityId in {action_id, lead_id}
+        or e.details.get("actionId") == action_id
+        or e.details.get("leadId") == lead_id
+    ]
+    return {"history": items}
+
+@app.get("/api/activities")
+def get_activities(limit: int = Query(default=50, ge=1, le=200)):
+    return {"activities": [e.model_dump() for e in db["activities"][:limit]]}
+
+@app.get("/api/pipeline")
+def get_pipeline():
+    stage_counts: Dict[str, int] = {}
+    for lead in db["leads"]:
+        stage_counts[lead.stage] = stage_counts.get(lead.stage, 0) + 1
+
+    health_counts = {"green": 0, "yellow": 0, "red": 0}
+    for lead in db["leads"]:
+        health_counts[get_deal_health_score(lead)["health"]] += 1
+
+    pending_actions = [a for a in db["actions"] if not a.completed and not a.sent]
+    return {
+        "stageCounts": stage_counts,
+        "healthCounts": health_counts,
+        "pendingActions": len(pending_actions),
+        "openActions": [action_with_lead(a) for a in pending_actions],
+    }
 
 @app.post("/api/actions/{action_id}/draft")
 async def generate_draft(action_id: str, payload: DraftRequest):
@@ -382,35 +709,108 @@ async def generate_draft(action_id: str, payload: DraftRequest):
         raise HTTPException(status_code=404, detail="Lead not found")
 
     prompt = f"""
-Write a real estate outreach draft.
-Tone: {payload.tone}
-Channel: {payload.channel}
-Goal: {payload.goal}
+Create a real estate outreach draft as JSON.
+
+Return one JSON object with this exact shape:
+For email:
+{{
+  "type": "email",
+  "subject": "...",
+  "body": "..."
+}}
+
+For sms:
+{{
+  "type": "sms",
+  "message": "..."
+}}
+
+For call:
+{{
+  "type": "call",
+  "opening": "...",
+  "talkTrack": ["...", "..."],
+  "questions": ["...", "..."],
+  "close": "...",
+  "voicemail": "..."
+}}
+
+Rules:
+- Tone: {payload.tone}
+- Channel: {payload.channel}
+- Goal: {payload.goal}
+- Do not invent facts.
+- Keep it concise and useful.
 
 Lead JSON:
 {lead.model_dump_json(indent=2)}
 
 Action JSON:
 {action.model_dump_json(indent=2)}
-
-Return only the draft text.
 """.strip()
 
-    try:
-        ai = await call_openai(prompt)
-        draft = ai.strip() if ai else fallback_draft(lead, action, payload.tone, payload.channel)
-        action.draft = draft
+    ai = await call_openai_json(prompt)
+    if ai:
+        draft = ai
+        source = "openai"
+    else:
+        draft = fallback_draft(lead, action, payload.tone, payload.channel, payload.goal)
+        source = "fallback"
+
+    action.draft = draft
+    action.draftUpdatedAt = now_iso()
+    if draft.get("type") == "email":
+        action.subject = draft.get("subject") or make_subject(lead)
+    else:
+        action.subject = action.subject or make_subject(lead)
+
+    log_activity(
+        "draft_created",
+        "action",
+        action.id,
+        f"Generated draft for {action.title}",
+        {"leadId": lead.id, "channel": draft.get("type"), "source": source},
+    )
+
+    return {
+        "actionId": action.id,
+        "subject": action.subject,
+        "draft": draft,
+        "draftText": draft_to_text(draft),
+        "source": source,
+    }
+
+@app.put("/api/actions/{action_id}/draft")
+def update_draft(action_id: str, payload: DraftUpdateRequest):
+    action = find_action(action_id)
+    if not action:
+        raise HTTPException(status_code=404, detail="Action not found")
+
+    lead = find_lead(action.leadId)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    action.draft = deepcopy(payload.draft)
+    action.draftUpdatedAt = now_iso()
+
+    if payload.subject is not None:
+        action.subject = payload.subject
+    elif action.draft.get("type") == "email" and not action.subject:
         action.subject = make_subject(lead)
-        return {
-            "draft": draft,
-            "subject": action.subject,
-            "tone": payload.tone,
-            "channel": payload.channel,
-            "goal": payload.goal,
-            "source": "openai" if ai else "fallback",
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    log_activity(
+        "draft_updated",
+        "action",
+        action.id,
+        f"Edited draft for {action.title}",
+        {"leadId": lead.id},
+    )
+
+    return {
+        "ok": True,
+        "message": "Draft saved",
+        "action": action_with_lead(action),
+    }
 
 @app.post("/api/actions/{action_id}/explain")
 async def explain_action(action_id: str, payload: ExplainRequest):
@@ -423,9 +823,10 @@ async def explain_action(action_id: str, payload: ExplainRequest):
         raise HTTPException(status_code=404, detail="Lead not found")
 
     prompt = f"""
-Explain why this action is important for a real estate agent.
+Explain why this action matters for a real estate agent.
+
 Detail level: {payload.detailLevel}
-Be transparent and specific.
+Be transparent, specific, and grounded in the data.
 
 Lead JSON:
 {lead.model_dump_json(indent=2)}
@@ -433,18 +834,43 @@ Lead JSON:
 Action JSON:
 {action.model_dump_json(indent=2)}
 
-Return a concise explanation.
+Return a concise answer.
 """.strip()
 
-    try:
-        ai = await call_openai(prompt)
-        if ai:
-            return {"explanation": ai.strip(), "source": "openai"}
+    ai = await call_openai_text(prompt)
+    if ai:
+        return {"explanation": ai, "source": "openai"}
 
-        fallback = fallback_explanation(lead, action)
-        return {"explanation": fallback, "source": "fallback"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    health = get_deal_health_score(lead)
+    summary = f"This action is {action.priority} priority because the deal is {health['health']} and needs a timely follow-up."
+
+    if payload.detailLevel == "short":
+        return {"explanation": summary, "source": "fallback"}
+
+    return {
+        "explanation": {
+            "summary": summary,
+            "bullets": [
+                f"Lead stage: {lead.stage}",
+                f"Last touch: {lead.lastTouchDays} days ago",
+                f"Email opened: {'yes' if lead.emailOpened else 'no'}",
+                f"Replied: {'yes' if lead.replied else 'no'}",
+                f"Engagement score: {lead.engagementScore}",
+            ],
+        },
+        "source": "fallback",
+    }
+
+@app.post("/api/actions/{action_id}/why")
+def why_action(action_id: str):
+    action = find_action(action_id)
+    if not action:
+        raise HTTPException(status_code=404, detail="Action not found")
+    lead = find_lead(action.leadId)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    return {"why": structured_why(lead, action)}
 
 @app.post("/api/actions/{action_id}/approve")
 def approve_action(action_id: str):
@@ -462,6 +888,14 @@ def approve_action(action_id: str):
     action.approved = True
     if not action.subject:
         action.subject = make_subject(lead)
+
+    log_activity(
+        "approved",
+        "action",
+        action.id,
+        f"Approved {action.title}",
+        {"leadId": lead.id},
+    )
 
     return {
         "ok": True,
@@ -485,59 +919,129 @@ def send_action(action_id: str):
     if not action.draft:
         raise HTTPException(status_code=400, detail="No draft found. Generate a draft first.")
 
-    if not lead.email:
-        raise HTTPException(status_code=400, detail="Lead has no email address on file")
+    recipient = lead.email if lead.email else lead.phone
+    if not recipient:
+        raise HTTPException(status_code=400, detail="Lead has no email or phone on file")
 
-    if not smtp_transporter_ready():
-        raise HTTPException(
-            status_code=500,
-            detail="SMTP is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and FROM_EMAIL.",
-        )
+    # FAKE SEND ONLY
+    print("=== FAKE MESSAGE SENT ===")
+    print(f"To: {recipient}")
+    if action.subject:
+        print(f"Subject: {action.subject}")
+    print(draft_to_text(action.draft))
+    print("=========================")
 
-    subject = action.subject or make_subject(lead)
+    action.sent = True
+    action.sentAt = now_iso()
+    action.sentTo = recipient
+    action.completed = True
 
-    try:
-        send_smtp_email(lead.email, subject, action.draft)
-        action.sent = True
-        action.sentAt = now_iso()
-        action.sentTo = lead.email
-        action.completed = True
-        return {
-            "ok": True,
-            "message": "Email sent successfully.",
-            "action": action_with_lead(action),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    log_activity(
+        "sent",
+        "action",
+        action.id,
+        f"Sent {action.title} (simulated)",
+        {"leadId": lead.id, "recipient": recipient, "channel": action.draft.get("type")},
+    )
+
+    return {
+        "ok": True,
+        "message": "Message sent (simulated)",
+        "action": action_with_lead(action),
+    }
+
+@app.post("/api/actions/{action_id}/complete")
+def complete_action(action_id: str):
+    action = find_action(action_id)
+    if not action:
+        raise HTTPException(status_code=404, detail="Action not found")
+
+    action.completed = True
+
+    log_activity(
+        "completed",
+        "action",
+        action.id,
+        f"Marked {action.title} complete",
+        {},
+    )
+
+    return {
+        "ok": True,
+        "message": "Action marked complete",
+        "action": action_with_lead(action),
+    }
 
 @app.post("/api/smart-plan")
 async def smart_plan(payload: SmartPlanRequest):
     prompt = f"""
 Create a follow-up cadence for a real estate lead.
+
+Return a JSON object with:
+{{
+  "title": "...",
+  "items": [
+    {{
+      "day": 0,
+      "channel": "email|sms|call",
+      "action": "...",
+      "rationale": "..."
+    }}
+  ]
+}}
+
 Lead type: {payload.leadType}
 Stage: {payload.stage}
 Days on market: {payload.daysOnMarket if payload.daysOnMarket is not None else "unknown"}
 Budget: {payload.budget if payload.budget is not None else "unknown"}
 
-Return a JSON array with 4 items. Each item should have: day, channel, action, rationale.
+Keep it realistic, concise, and specific.
 """.strip()
 
-    try:
-        ai = await call_openai(prompt)
-        if ai:
-            return {"plan": ai.strip(), "source": "openai"}
+    ai = await call_openai_json(prompt)
+    if ai:
+        return {"plan": ai, "source": "openai"}
 
-        fallback = [
-            SmartPlanItem(day=0, channel="email", action="Send a concise value-add follow-up", rationale="Start with context and a clear next step."),
-            SmartPlanItem(day=3, channel="sms", action="Send a brief check-in text", rationale="Lightweight nudge to keep momentum without being intrusive."),
-            SmartPlanItem(day=7, channel="call", action="Call to discuss next steps", rationale="Higher-touch outreach helps when engagement is cooling."),
-            SmartPlanItem(day=14, channel="email", action="Send a final value recap and CTA", rationale="Reinforce benefits and reopen the conversation."),
-        ]
-        return {"plan": [item.model_dump() for item in fallback], "source": "fallback"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    fallback = {
+        "title": f"{payload.leadType.title()} follow-up cadence",
+        "items": [
+            {
+                "day": 0,
+                "channel": "email",
+                "action": "Send a concise value-add follow-up",
+                "rationale": "Start with context and a clear next step.",
+            },
+            {
+                "day": 3,
+                "channel": "sms",
+                "action": "Send a brief check-in text",
+                "rationale": "Lightweight nudge to keep momentum without being intrusive.",
+            },
+            {
+                "day": 7,
+                "channel": "call",
+                "action": "Call to discuss next steps",
+                "rationale": "Higher-touch outreach helps when engagement is cooling.",
+            },
+            {
+                "day": 14,
+                "channel": "email",
+                "action": "Send a final value recap and CTA",
+                "rationale": "Reinforce benefits and reopen the conversation.",
+            },
+        ],
+    }
+    return {"plan": fallback, "source": "fallback"}
 
 @app.post("/api/mock/seed")
 def mock_seed():
     seed_data()
-    return {"ok": True, "leads": len(db["leads"]), "actions": len(db["actions"])}
+    return {"ok": True, "leads": len(db["leads"]), "actions": len(db["actions"]), "activities": len(db["activities"])}
+
+# -----------------------------
+# Local run
+# -----------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
